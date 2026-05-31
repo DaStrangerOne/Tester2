@@ -246,7 +246,13 @@ export default function AgentsScreen() {
           context: context || 'Authorized security assessment, Linux environment',
         }),
       });
-      const data = await res.json();
+      const raw = await res.text();
+      let data: any;
+      try { data = JSON.parse(raw); } catch {
+        setPlanError(`Backend returned non-JSON (HTTP ${res.status}): ${raw.slice(0, 180)}`);
+        addLog(`ERROR: backend ${res.status} — ${raw.slice(0, 120)}`);
+        return;
+      }
 
       if (data.error) {
         setPlanError(data.error);
@@ -295,7 +301,11 @@ export default function AgentsScreen() {
         body: JSON.stringify({ language: step.language || 'bash', code }),
       });
 
-      const json = await res.json();
+      const rawTxt = await res.text();
+      let json: any;
+      try { json = JSON.parse(rawTxt); } catch {
+        json = { success: false, output: `Backend returned non-JSON (HTTP ${res.status}): ${rawTxt.slice(0, 180)}` };
+      }
       const output = json.output || json.error || '(no output)';
       const dur = Date.now() - t0;
 
@@ -351,7 +361,9 @@ export default function AgentsScreen() {
           })),
         }),
       });
-      const data = await res.json();
+      const stepTxt = await res.text();
+      let data: any;
+      try { data = JSON.parse(stepTxt); } catch { data = {}; }
       addLog(`Analysis: ${data.next_action?.toUpperCase() || 'continue'} | Confidence: ${data.confidence || 0}%`);
       return data;
     } catch {
@@ -432,7 +444,11 @@ export default function AgentsScreen() {
           })),
         }),
       });
-      const data = await res.json();
+      const sumTxt = await res.text();
+      let data: any;
+      try { data = JSON.parse(sumTxt); } catch {
+        data = { status: 'failed', findings_summary: `Backend returned non-JSON: ${sumTxt.slice(0, 180)}` };
+      }
       setSummary(data);
       setShowSummary(true);
       addLog(`Summary: ${data.status?.toUpperCase()} — ${data.findings_summary?.slice(0, 80) || 'Complete'}`);
