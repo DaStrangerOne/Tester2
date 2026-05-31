@@ -262,7 +262,7 @@ export default function OpsScreen() {
     const cmd = buildCmd(item.command, arsenalTarget);
     try {
       const res = await fetch(
-        `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/code-exec`,
+        `${process.env.EXPO_PUBLIC_CODE_EXEC_URL || `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/code-exec`}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY}` },
@@ -342,7 +342,7 @@ export default function OpsScreen() {
     const t0 = Date.now();
     try {
       const res = await fetch(
-        `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/code-exec`,
+        `${process.env.EXPO_PUBLIC_CODE_EXEC_URL || `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/code-exec`}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY}` },

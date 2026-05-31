@@ -292,7 +292,7 @@ export default function AgentsScreen() {
 
     const t0 = Date.now();
     try {
-      const res = await fetch(`${SUPABASE_URL}/functions/v1/code-exec`, {
+      const res = await fetch(`${process.env.EXPO_PUBLIC_CODE_EXEC_URL || `${SUPABASE_URL}/functions/v1/code-exec`}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
