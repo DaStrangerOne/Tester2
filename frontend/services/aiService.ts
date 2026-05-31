@@ -58,7 +58,7 @@ export async function sendMessage(
       : {};
 
     const response = await fetch(
-      `${process.env.EXPO_PUBLIC_API_URL || supabaseUrl}/api/axiom-chat`,
+      `${supabaseUrl}/functions/v1/axiom-chat`,
       {
         method: 'POST',
         headers: {
