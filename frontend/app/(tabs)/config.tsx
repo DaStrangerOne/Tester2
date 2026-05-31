@@ -275,7 +275,7 @@ export default function ConfigScreen() {
     try {
       const currentPrompt = await getSystemPrompt();
       const kbSummary = kb.slice(0, 5).map(e => `• ${e.title}`).join('\n');
-      const res = await fetch(`${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/axiom-chat`, {
+      const res = await fetch(`${process.env.EXPO_PUBLIC_API_URL || process.env.EXPO_PUBLIC_SUPABASE_URL}/api/axiom-chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY}` },
         body: JSON.stringify({
@@ -362,7 +362,7 @@ export default function ConfigScreen() {
     setUsersLoading(true);
     try {
       const res = await fetch(
-        `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/get-users`,
+        `${process.env.EXPO_PUBLIC_API_URL || process.env.EXPO_PUBLIC_SUPABASE_URL}/api/get-users`,
         {
           method: 'POST',
           headers: {
@@ -490,7 +490,7 @@ Key components:
 Please produce the complete artifact now. Start immediately with the first FILE comment.`;
 
       const res = await fetch(
-        `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/axiom-chat`,
+        `${process.env.EXPO_PUBLIC_API_URL || process.env.EXPO_PUBLIC_SUPABASE_URL}/api/axiom-chat`,
         {
           method: 'POST',
           headers: {
@@ -586,7 +586,7 @@ Please produce the complete artifact now. Start immediately with the first FILE 
     setSecretsLoading(true);
     try {
       const res = await fetch(
-        `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/get-secrets`,
+        `${process.env.EXPO_PUBLIC_API_URL || process.env.EXPO_PUBLIC_SUPABASE_URL}/api/get-secrets`,
         {
           method: 'POST',
           headers: {

@@ -99,7 +99,7 @@ export default function IntelScreen() {
         technical: 'Generate technical pentest findings: SCOPE, DETAILED FINDINGS with CVSSv3.1, POC steps, AFFECTED SYSTEMS, MITIGATIONS, REMEDIATION roadmap, VERIFICATION criteria.',
         ioc: 'Generate IOC report for blue team: FILE INDICATORS, NETWORK INDICATORS, HOST INDICATORS, YARA RULES, SIGMA detection rules, STIX2 format summary.',
       };
-      const res = await fetch(`${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/axiom-chat`, {
+      const res = await fetch(`${process.env.EXPO_PUBLIC_API_URL || process.env.EXPO_PUBLIC_SUPABASE_URL}/api/axiom-chat`, {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY}` },
         body: JSON.stringify({ messages: [{ role: 'system', content: 'You are AXIOM. Generate professional security reports. Use markdown.' }, { role: 'user', content: prompts[reportType] }], stream: false }),
       });

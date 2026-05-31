@@ -43,3 +43,33 @@ Because the container's inotify watcher limit (12288) is far below what Metro ne
 ## Backlog (not requested, future ideas)
 - Native iOS/Android builds via EAS.
 - Wire the FastAPI stub into a real MongoDB-backed feature if the Supabase backend ever needs a sidecar.
+
+---
+
+## 2026-05-31 — AI runtime swap + tool install
+
+**Problem reported (from screenshots):** Recon Agent ran inside the OnSpace/Supabase Piston sandbox, which lacked `nmap`, `host`, `curl`, `jq`, etc. — every operation report said *"Execution environment lacks essential binary dependencies"*, exit code 127.
+
+**Fix delivered:**
+1. **AI runtime swap** — `axiom-chat`, `axiom-agent`, `axiom-attack` now run inside `/app/backend/server.py` powered by `emergentintegrations.llm.chat.LlmChat` → **Anthropic claude-sonnet-4-5-20250929** via the Emergent Universal Key. OpenAI-shaped SSE streaming is synthesized so the existing frontend SSE parser is unchanged.
+2. **Local shell runtime** — `/api/code-exec` runs `bash | python3 | node` directly in this container via `asyncio.create_subprocess_exec` with a 30s timeout, working dir in `/tmp`, PATH restored. No external Piston / Wandbox.
+3. **Toolchain installed** — `nmap, dnsutils (host, dig), whois, netcat-openbsd, net-tools, iputils-ping, traceroute, jq, curl`. Verified via `/api/health` (12/12 tools present).
+4. **Sandbox-aware prompts** — `SANDBOX_NOTES` injected into every agent persona (recon/exploit/postexploit/evasion/fullchain) AND into `axiom-attack`. Tells the LLM that NET_RAW is stripped, so it must use `nc -zv`, `curl -sIm5`, `nmap -Pn -sT --unprivileged` instead of `ping` or raw-socket SYN scans. Verified — generated plans no longer contain `ping`.
+5. **Frontend wiring** — added `EXPO_PUBLIC_API_URL` in `frontend/.env` pointing at the preview URL. Replaced `${EXPO_PUBLIC_SUPABASE_URL}/functions/v1/` with `${EXPO_PUBLIC_API_URL || ...SUPABASE_URL}/api/` across `services/aiService.ts` and `app/(tabs)/{ops,terminal,intel,config,build,agents}.tsx`. Static export rebuilt by `yarn start`.
+
+**Verification (live, public preview URL):**
+- `GET  /api/health` → 12 tools confirmed.
+- `POST /api/code-exec` running `nmap -Pn -sT scanme.nmap.org` → exit 0, ports 22 & 80 open.
+- `POST /api/code-exec` running `host google.com | curl example.com | jq` → all succeed.
+- `POST /api/axiom-chat` with AXIOM system prompt → "AXIOM v2.5 online — red team protocols active".
+- `POST /api/axiom-attack mode=plan` → 10-step JSON plan, no `ping`, all `nc -zv` / `nmap -Pn -sT`.
+- `POST /api/axiom-agent mode=plan agentType=recon` → JSON plan with sandbox-safe `nc -zv`, TCP-connect scan.
+
+**Auth still uses Supabase** (untouched). The user only asked to swap AI + exec runtime.
+
+## Next Action Items
+- Sign in and run a Recon Agent against `scanme.nmap.org` or `127.0.0.1` — the "Operation Report" should now succeed instead of "Critical Findings: missing binaries".
+- If a different LLM is preferred (e.g., `gpt-5.4` for cheaper plans, or `claude-opus-4-7` for harder reasoning), change `AXIOM_LLM_PROVIDER` / `AXIOM_LLM_MODEL` in `/app/backend/.env`.
+
+## Note
+`ping` is installed but blocked by container capabilities (no NET_RAW). Plans avoid it. Same for `nmap -sS`. If you ever need raw sockets, this would have to be deployed to a container with `--cap-add=NET_RAW`.

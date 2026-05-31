@@ -192,7 +192,7 @@ export default function TerminalScreen() {
       const timer = setTimeout(() => controller.abort(), 25000);
 
       const res = await fetch(
-        `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/code-exec`,
+        `${process.env.EXPO_PUBLIC_API_URL || process.env.EXPO_PUBLIC_SUPABASE_URL}/api/code-exec`,
         {
           method: 'POST',
           headers: {

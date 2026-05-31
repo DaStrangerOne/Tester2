@@ -25,7 +25,7 @@ import { useChatContext } from '@/hooks/useChatContext';
 import { useRouter } from 'expo-router';
 
 const MONO = Platform.OS === 'ios' ? 'Menlo' : 'monospace';
-const SUPABASE_URL = process.env.EXPO_PUBLIC_SUPABASE_URL;
+const SUPABASE_URL = process.env.EXPO_PUBLIC_API_URL || process.env.EXPO_PUBLIC_SUPABASE_URL;
 const SUPABASE_KEY = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY;
 
 // ── Agent definitions ──────────────────────────────────────────────────────────
@@ -232,7 +232,7 @@ export default function AgentsScreen() {
     addLog(`Target: ${target || '(no target specified)'}`);
 
     try {
-      const res = await fetch(`${SUPABASE_URL}/functions/v1/axiom-agent`, {
+      const res = await fetch(`${SUPABASE_URL}/api/axiom-agent`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -286,7 +286,7 @@ export default function AgentsScreen() {
 
     const t0 = Date.now();
     try {
-      const res = await fetch(`${SUPABASE_URL}/functions/v1/code-exec`, {
+      const res = await fetch(`${SUPABASE_URL}/api/code-exec`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -332,7 +332,7 @@ export default function AgentsScreen() {
   const analyzeStep = useCallback(async (step: AgentStep, completedSteps: AgentStep[]): Promise<AgentStep['analysis']> => {
     addLog(`Analyzing output for: ${step.name}`);
     try {
-      const res = await fetch(`${SUPABASE_URL}/functions/v1/axiom-agent`, {
+      const res = await fetch(`${SUPABASE_URL}/api/axiom-agent`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -413,7 +413,7 @@ export default function AgentsScreen() {
     setIsSummarizing(true);
     addLog('Generating operation summary...');
     try {
-      const res = await fetch(`${SUPABASE_URL}/functions/v1/axiom-agent`, {
+      const res = await fetch(`${SUPABASE_URL}/api/axiom-agent`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
