@@ -1,537 +1,153 @@
 """
-AxiomRed local backend.
+AXIOM backend — exec service for the static AXIOM UI.
 
-Replaces the OnSpace/Supabase edge functions with:
-  - /api/axiom-chat   — OpenAI-shaped chat (SSE or JSON) via Emergent LLM (Claude Sonnet 4.5)
-  - /api/axiom-agent  — Agent plan/step/summarize JSON
-  - /api/axiom-attack — Attack plan/step/analyze JSON
-  - /api/code-exec    — Executes bash/python/node code IN THIS CONTAINER (nmap, host, curl, jq, etc. are installed)
-  - /api/get-secrets  — Minimal compatibility shim
-  - /api/get-users    — Minimal compatibility shim
-  - /api/health
+The static UI (/app/new-app/index.html) only needs two endpoints:
+  GET  /api/ping                       → 200 OK health probe
+  POST /api/exec  body {cmd, language, timeout}  → {stdout, stderr, exitCode}
+
+Design assumptions (per operator request):
+  • Operators reaching this endpoint have already been vetted by the platform.
+  • NO command filtering / no allow-list / no rejection. Every command the AI
+    plans (nmap, host, dig, whois, nc, curl, jq, traceroute, python3, node,
+    bash, etc.) is forwarded verbatim to the shell. Highest privilege within
+    the container's kernel-imposed bounds is assumed and exercised.
+  • Container is unprivileged (no NET_RAW, no NET_ADMIN); the kernel will reject
+    raw sockets regardless of any userspace policy. Stderr is captured and
+    returned verbatim so the UI can interpret it.
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
-import json
 import os
-import re
 import shutil
 import tempfile
-import time
-import uuid
 from typing import Any, Dict, List, Optional
 
+import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-# Load .env before importing emergentintegrations
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-from emergentintegrations.llm.chat import LlmChat, UserMessage  # noqa: E402
+AXIOM_BACKEND_TOKEN = os.environ.get("AXIOM_BACKEND_TOKEN", "").strip()
 
-EMERGENT_LLM_KEY = os.environ["EMERGENT_LLM_KEY"]
-LLM_PROVIDER = os.environ.get("AXIOM_LLM_PROVIDER", "anthropic")
-LLM_MODEL = os.environ.get("AXIOM_LLM_MODEL", "claude-sonnet-4-5-20250929")
-
-app = FastAPI(title="AxiomRed Backend", version="2.5.0")
+app = FastAPI(title="AXIOM Exec Service", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
+
+LANG_RUNNERS: Dict[str, Dict[str, str]] = {
+    "shell":      {"interp": "/bin/bash", "ext": ".sh",  "version": "bash 5.x"},
+    "bash":       {"interp": "/bin/bash", "ext": ".sh",  "version": "bash 5.x"},
+    "sh":         {"interp": "/bin/bash", "ext": ".sh",  "version": "bash 5.x"},
+    "python":     {"interp": "python3",   "ext": ".py",  "version": "python 3.11"},
+    "python3":    {"interp": "python3",   "ext": ".py",  "version": "python 3.11"},
+    "py":         {"interp": "python3",   "ext": ".py",  "version": "python 3.11"},
+    "javascript": {"interp": "node",      "ext": ".js",  "version": "node 20"},
+    "js":         {"interp": "node",      "ext": ".js",  "version": "node 20"},
+    "node":       {"interp": "node",      "ext": ".js",  "version": "node 20"},
+}
+
+
+def _check_auth(authorization: Optional[str]) -> None:
+    """Optional bearer-token check. Only enforced when AXIOM_BACKEND_TOKEN is set."""
+    if not AXIOM_BACKEND_TOKEN:
+        return
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Bearer token required")
+    if authorization.split(None, 1)[1].strip() != AXIOM_BACKEND_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid bearer token")
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # Health
 # ────────────────────────────────────────────────────────────────────────────
 
 
-@app.get("/api/health")
-async def health() -> Dict[str, Any]:
+@app.get("/api/ping")
+async def ping_api() -> Dict[str, Any]:
+    return _ping_payload()
+
+
+@app.get("/ping")
+async def ping_bare() -> Dict[str, Any]:
+    # Mirror of /api/ping so an operator can configure the backend URL either
+    # WITH or WITHOUT the trailing /api segment and "TEST CONNECTION" still works.
+    return _ping_payload()
+
+
+def _ping_payload() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "service": "axiomred",
-        "llm": {"provider": LLM_PROVIDER, "model": LLM_MODEL},
-        "tools": {name: bool(shutil.which(name)) for name in [
-            "bash", "python3", "node", "curl", "jq", "nmap", "host",
-            "dig", "whois", "nc", "traceroute", "ping",
-        ]},
-    }
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# LLM helper
-# ────────────────────────────────────────────────────────────────────────────
-
-
-async def _llm_complete(messages: List[Dict[str, str]], temperature: float = 0.3) -> str:
-    """Send a chat completion to the configured Emergent LLM and return the text."""
-    system_parts = [m["content"] for m in messages if m.get("role") == "system" and m.get("content")]
-    non_system = [m for m in messages if m.get("role") != "system"]
-    if not non_system:
-        return ""
-
-    system_message = "\n\n".join(system_parts) if system_parts else "You are AXIOM, a red team AI."
-
-    chat = LlmChat(
-        api_key=EMERGENT_LLM_KEY,
-        session_id=f"axiom-{uuid.uuid4().hex[:12]}",
-        system_message=system_message,
-    ).with_model(LLM_PROVIDER, LLM_MODEL).with_params(temperature=temperature)
-
-    # Replay prior turns (everything except the most recent user message) as initial_messages
-    *prior, last = non_system
-    if prior:
-        # The library accepts initial_messages via constructor only, so push them via send loop
-        # We approximate by concatenating prior turns into the user message context.
-        history_text = "\n\n".join(f"[{m['role'].upper()}] {m['content']}" for m in prior)
-        user_text = f"{history_text}\n\n[USER] {last['content']}" if history_text else last["content"]
-    else:
-        user_text = last["content"]
-
-    response = await chat.send_message(UserMessage(text=user_text))
-    return str(response or "")
-
-
-def _extract_json(text: str) -> Any:
-    """Best-effort JSON extraction from an LLM response."""
-    if not text:
-        return None
-    s = text.strip()
-    # Strip code fences
-    if s.startswith("```"):
-        s = re.sub(r"^```(?:json)?\s*", "", s)
-        s = re.sub(r"\s*```$", "", s)
-    try:
-        return json.loads(s)
-    except Exception:
-        pass
-    m = re.search(r"\{[\s\S]*\}", s)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            return {"error": "Failed to parse AI response", "raw": text[:800]}
-    return {"error": "No JSON in response", "raw": text[:800]}
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# /api/axiom-chat — OpenAI-compatible chat (supports SSE)
-# ────────────────────────────────────────────────────────────────────────────
-
-
-class ChatRequest(BaseModel):
-    messages: List[Dict[str, Any]]
-    stream: Optional[bool] = True
-    model: Optional[str] = None
-    temperature: Optional[float] = 0.3
-    customBaseUrl: Optional[str] = None
-    customApiKey: Optional[str] = None
-
-
-def _sse(obj: Any) -> bytes:
-    return f"data: {json.dumps(obj, separators=(',', ':'))}\n\n".encode("utf-8")
-
-
-@app.post("/api/axiom-chat")
-async def axiom_chat(req: ChatRequest):
-    msgs = [{"role": m.get("role", "user"), "content": str(m.get("content", ""))} for m in req.messages]
-    try:
-        text = await _llm_complete(msgs, temperature=req.temperature or 0.3)
-    except Exception as e:  # noqa: BLE001
-        return JSONResponse({"error": f"AI Error: {e}"}, status_code=500)
-
-    if req.stream is False:
-        # OpenAI-shaped non-streaming response
-        return {
-            "id": f"chatcmpl-{uuid.uuid4().hex[:16]}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": req.model or LLM_MODEL,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
-            }],
-        }
-
-    # SSE stream — emit text in small chunks so the UI feels alive
-    async def gen():
-        completion_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
-        chunk_size = 32
-        for i in range(0, len(text), chunk_size):
-            piece = text[i:i + chunk_size]
-            yield _sse({
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": req.model or LLM_MODEL,
-                "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
-            })
-            await asyncio.sleep(0.01)
-        yield _sse({
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": req.model or LLM_MODEL,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-        })
-        yield b"data: [DONE]\n\n"
-
-    return StreamingResponse(gen(), media_type="text/event-stream", headers={
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
-    })
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# /api/axiom-agent — agent plan/step/summarize (JSON)
-# ────────────────────────────────────────────────────────────────────────────
-
-
-SANDBOX_NOTES = (
-    "SANDBOX ENVIRONMENT NOTES (critical — obey strictly):\n"
-    "- OS: Debian Linux container, x86_64-style userspace. You ARE root but raw sockets / NET_RAW are STRIPPED.\n"
-    "- DO NOT use `ping` (ICMP raw socket — fails with 'Operation not permitted').\n"
-    "- For nmap: ALWAYS use `nmap -Pn -sT` (TCP connect) or `nmap --unprivileged`. NEVER use -sS/-sU/-O.\n"
-    "- For host-alive checks, use `nc -zv -w2 <host> <port>` or `curl -sIm5 http://<host>` instead of ping.\n"
-    "- Tools guaranteed installed: bash, python3 (3.11), node (20), curl, jq, nmap, host, dig, whois, nc, traceroute.\n"
-    "- Per-command timeout is 30s by default. Prefer `nmap -T4 --top-ports 50` over full port sweeps.\n"
-    "- Bash scripts run from a fresh tmp dir, no persistent state between steps.\n"
-)
-
-AGENT_PERSONAS: Dict[str, str] = {
-    "recon": (
-        "You are AXIOM Recon Agent. Generate a comprehensive reconnaissance plan.\n"
-        "Focus on: passive OSINT, DNS enumeration, port scanning, service fingerprinting,\n"
-        "web technology detection, certificate transparency, subdomain discovery, banner grabbing.\n"
-        + SANDBOX_NOTES
-    ),
-    "exploit": (
-        "You are AXIOM Exploit Agent. Generate a targeted exploitation plan.\n"
-        "Focus on: vulnerability identification, CVE exploitation, web app attacks\n"
-        "(SQLi/XSS/LFI/RCE), authentication bypass, service exploitation.\n"
-        + SANDBOX_NOTES
-    ),
-    "postexploit": (
-        "You are AXIOM Post-Exploit Agent. Generate a post-exploitation plan.\n"
-        "Focus on: privilege escalation, persistence, credential harvesting, lateral movement,\n"
-        "data exfiltration, covering tracks.\n"
-        + SANDBOX_NOTES
-    ),
-    "evasion": (
-        "You are AXIOM Evasion Agent. Generate a defense evasion plan.\n"
-        "Focus on: AV/EDR bypass, log clearing, AMSI patching, obfuscation, living-off-the-land,\n"
-        "traffic blending.\n"
-        + SANDBOX_NOTES
-    ),
-    "fullchain": (
-        "You are AXIOM Full Chain Agent. Generate a complete attack chain from recon to impact.\n"
-        "Cover all phases: Recon → Initial Access → Execution → Persistence → Privilege Escalation\n"
-        "→ Defense Evasion → Credential Access → Lateral Movement → Exfiltration.\n"
-        + SANDBOX_NOTES
-    ),
-}
-
-
-class AgentRequest(BaseModel):
-    mode: str = Field(..., description="plan | step | summarize")
-    agentType: Optional[str] = "recon"
-    target: Optional[str] = None
-    objective: Optional[str] = None
-    context: Optional[str] = None
-    previousSteps: Optional[List[Dict[str, Any]]] = None
-    currentOutput: Optional[str] = None
-    model: Optional[str] = None
-
-
-@app.post("/api/axiom-agent")
-async def axiom_agent(req: AgentRequest):
-    agent_type = (req.agentType or "recon").lower()
-    persona = AGENT_PERSONAS.get(agent_type, AGENT_PERSONAS["recon"])
-
-    if req.mode == "plan":
-        system_prompt = persona + """
-
-CRITICAL: Respond ONLY with valid JSON. No markdown, no code fences.
-Schema:
-{
-  "agent": "string",
-  "objective": "string",
-  "target": "string",
-  "estimated_duration": "string",
-  "risk_level": "low|medium|high|critical",
-  "steps": [
-    {
-      "id": 1,
-      "name": "step name",
-      "phase": "phase name",
-      "objective": "what this step achieves",
-      "language": "bash|python|javascript",
-      "code": "COMPLETE executable code using {TARGET} placeholder",
-      "expected_output": "what success looks like",
-      "decision_logic": "how to interpret results for next step",
-      "mitre_id": "T1xxx",
-      "risk": "low|medium|high|critical",
-      "evasion": "evasion notes if applicable"
-    }
-  ],
-  "success_criteria": "string",
-  "notes": "string"
-}"""
-        user_prompt = (
-            f"Generate an autonomous {agent_type} agent plan.\n"
-            f"Target: {req.target or 'unspecified (use 127.0.0.1 for safe demo)'}\n"
-            f"Objective: {req.objective or 'Comprehensive ' + agent_type + ' operation'}\n"
-            f"Context: {req.context or 'Authorized security assessment, Linux environment'}\n\n"
-            "Generate 6-10 realistic steps. All code must be EXECUTABLE in bash/python using ONLY "
-            "the tools available (nmap, host, dig, whois, curl, jq, nc, traceroute, ping, python3, node). "
-            "Do NOT call interactive editors or tools that require root unless ping/traceroute. "
-            "Use {TARGET} placeholder for target IP/domain. Make each step's output parseable."
-        )
-    elif req.mode == "step":
-        system_prompt = (
-            "You are AXIOM Autonomous Agent decision engine.\n"
-            "Analyze the output of an executed attack step and determine:\n"
-            "1. Was it successful?\n2. What intelligence was gathered?\n3. What is the optimal next action?\n\n"
-            "Respond ONLY with JSON:\n"
-            "{\n"
-            '  "success": true,\n'
-            '  "confidence": 0,\n'
-            '  "findings": ["finding1"],\n'
-            '  "extracted_data": {"ips": [], "ports": [], "services": [], "credentials": [], "vulnerabilities": [], "mitre_ids": []},\n'
-            '  "threat_assessment": "string",\n'
-            '  "next_action": "continue|pivot|abort|complete",\n'
-            '  "next_step_suggestion": "string",\n'
-            '  "notes": "string"\n'
-            "}"
-        )
-        prev_ctx = ""
-        if req.previousSteps:
-            prev_ctx = "Previous steps:\n" + "\n".join(
-                f"- {s.get('name')}: {'SUCCESS' if s.get('success') else 'FAILED'}" for s in req.previousSteps
+        "service": "axiom-exec",
+        "auth_required": bool(AXIOM_BACKEND_TOKEN),
+        "tools": {
+            name: bool(shutil.which(name))
+            for name in (
+                "bash", "python3", "node", "curl", "jq", "nmap", "host",
+                "dig", "whois", "nc", "traceroute", "ping",
             )
-        else:
-            prev_ctx = "No previous steps"
-        user_prompt = (
-            f"Analyze this agent step output:\n\nAgent Type: {agent_type}\nTarget: {req.target}\n"
-            f"Current Step: {req.objective}\n{prev_ctx}\n\n"
-            f"Command Output:\n{req.currentOutput or '(no output)'}\n\n"
-            "Determine success, extract intelligence, and recommend next action."
-        )
-    elif req.mode == "summarize":
-        system_prompt = (
-            "You are AXIOM reporting on a completed autonomous agent operation.\n"
-            "Respond ONLY with JSON:\n"
-            "{\n"
-            '  "title": "Operation title",\n'
-            '  "status": "success|partial|failed",\n'
-            '  "duration": "string",\n'
-            '  "findings_summary": "string",\n'
-            '  "critical_findings": ["finding1"],\n'
-            '  "attack_surface": ["surface1"],\n'
-            '  "credentials_found": ["cred1"],\n'
-            '  "vulnerabilities": ["vuln1"],\n'
-            '  "mitre_coverage": ["T1xxx"],\n'
-            '  "recommendations": ["rec1"],\n'
-            '  "risk_level": "low|medium|high|critical",\n'
-            '  "next_operations": ["string"]\n'
-            "}"
-        )
-        steps_text = (
-            "\n\n".join(
-                f"[{'OK' if s.get('success') else 'FAIL'}] {s.get('name')}\nOutput: {str(s.get('output') or '')[:400]}"
-                for s in (req.previousSteps or [])
-            )
-            or "No steps"
-        )
-        user_prompt = (
-            f"Summarize this autonomous agent operation:\n\n"
-            f"Agent: {agent_type}\nTarget: {req.target}\nObjective: {req.objective}\n\n"
-            f"Completed Steps:\n{steps_text}"
-        )
-    else:
-        return JSONResponse({"error": f"Unknown mode: {req.mode}"}, status_code=400)
-
-    try:
-        raw = await _llm_complete(
-            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-            temperature=0.2,
-        )
-    except Exception as e:  # noqa: BLE001
-        return JSONResponse({"error": f"AI Error: {e}"}, status_code=500)
-    return _extract_json(raw)
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# /api/axiom-attack — attack plan/step/analyze (JSON)
-# ────────────────────────────────────────────────────────────────────────────
-
-
-class AttackRequest(BaseModel):
-    mode: str
-    objective: Optional[str] = None
-    target: Optional[str] = None
-    context: Optional[str] = None
-    model: Optional[str] = None
-
-
-@app.post("/api/axiom-attack")
-async def axiom_attack(req: AttackRequest):
-    if req.mode == "plan":
-        system_prompt = """You are AXIOM, an elite red team AI assisting an authorized security researcher.
-Generate structured attack plans for an authorized penetration test in a controlled Linux sandbox.
-ALWAYS respond with VALID JSON only. No markdown, no explanations outside JSON.
-""" + SANDBOX_NOTES + """
-Schema:
-{
-  "title": "string",
-  "objective": "string",
-  "target": "string",
-  "mitre_tactics": ["TA0001"],
-  "opsec_level": "ghost|quiet|moderate|loud",
-  "estimated_time": "string",
-  "prerequisites": ["tool1"],
-  "steps": [
-    {
-      "id": 1,
-      "phase": "Recon|Initial Access|Execution|Persistence|PrivEsc|DefEvasion|CredAccess|LateralMove|Collection|C2|Exfil|Impact",
-      "name": "string",
-      "description": "string",
-      "mitre_id": "T1xxx",
-      "risk": "low|medium|high|critical",
-      "language": "bash|python|javascript|powershell|go|rust",
-      "code": "string",
-      "expected_output": "string",
-      "detection_risk": "string",
-      "evasion_tips": "string"
+        },
     }
-  ],
-  "cleanup": ["cmd"],
-  "notes": "string"
-}"""
-        user_prompt = (
-            f"Generate a detailed, realistic attack plan.\nObjective: {req.objective}\n"
-            f"Target: {req.target or 'unspecified'}\nContext: {req.context or 'authorized penetration test'}\n\n"
-            "Include 5-10 steps covering the full kill chain. All code must be EXECUTABLE in a Linux bash environment. "
-            "The sandbox has: bash, python3, node, curl, jq, nmap, host, dig, whois, nc, traceroute, ping. "
-            "Use {TARGET} as placeholder for the target IP/domain."
-        )
-    elif req.mode == "step":
-        system_prompt = """You are AXIOM, an elite red team AI executing attack steps for an authorized assessment.
-Provide DETAILED technical guidance with real, executable code.
-""" + SANDBOX_NOTES + """
-Respond as JSON only:
-{
-  "analysis": "string",
-  "code": "string",
-  "language": "bash|python|javascript|powershell",
-  "explanation": "string",
-  "expected_output": "string",
-  "next_actions": ["string"],
-  "evasion": "string",
-  "pivot": "string"
-}"""
-        user_prompt = (
-            f"Execute this attack step and provide full technical detail:\nStep: {req.objective}\n"
-            f"Target: {req.target or 'target'}\nContext: {req.context or ''}\n"
-            "Provide complete, working code that runs in a Linux container with nmap/host/dig/whois/curl/jq/nc/python3."
-        )
-    elif req.mode == "analyze":
-        system_prompt = """You are AXIOM, analyzing attack output. Respond as JSON:
-{
-  "success": true,
-  "findings": ["finding1"],
-  "vulnerabilities": ["vuln1"],
-  "credentials": ["cred1"],
-  "next_steps": ["next1"],
-  "mitre_ids": ["T1xxx"],
-  "pivot_opportunities": ["opportunity1"],
-  "summary": "string"
-}"""
-        user_prompt = (
-            f"Analyze this attack output and extract intelligence:\n"
-            f"Command: {req.objective}\nOutput: {req.target}\nContext: {req.context or ''}"
-        )
-    else:
-        return JSONResponse({"error": f"Unknown mode: {req.mode}"}, status_code=400)
 
-    try:
-        raw = await _llm_complete(
-            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-            temperature=0.3,
-        )
-    except Exception as e:  # noqa: BLE001
-        return JSONResponse({"error": f"AI Error: {e}"}, status_code=500)
-    return _extract_json(raw)
+
+@app.get("/api/health")
+async def health_alias() -> Dict[str, Any]:
+    return _ping_payload()
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# /api/code-exec — runs code IN THIS CONTAINER
+# Exec
 # ────────────────────────────────────────────────────────────────────────────
 
 
-LANG_RUNNERS: Dict[str, Dict[str, str]] = {
-    "bash":       {"interp": "/bin/bash", "ext": ".sh",  "version": "5.x"},
-    "sh":         {"interp": "/bin/bash", "ext": ".sh",  "version": "5.x"},
-    "python":     {"interp": "python3",   "ext": ".py",  "version": "3.11"},
-    "python3":    {"interp": "python3",   "ext": ".py",  "version": "3.11"},
-    "javascript": {"interp": "node",      "ext": ".js",  "version": "20.x"},
-    "js":         {"interp": "node",      "ext": ".js",  "version": "20.x"},
-    "node":       {"interp": "node",      "ext": ".js",  "version": "20.x"},
-}
-
-
-class CodeExecRequest(BaseModel):
-    language: str
-    code: str
+class ExecRequest(BaseModel):
+    cmd: Optional[str] = None
+    code: Optional[str] = None              # alias accepted from older callers
+    language: Optional[str] = "shell"
+    timeout: Optional[int] = 15
     stdin: Optional[str] = ""
     args: Optional[List[str]] = None
-    timeout: Optional[int] = 30
 
 
-@app.post("/api/code-exec")
-async def code_exec(req: CodeExecRequest):
-    lang = (req.language or "").lower().strip()
-    runner = LANG_RUNNERS.get(lang)
+async def _run(req: ExecRequest) -> Dict[str, Any]:
+    payload = (req.cmd if req.cmd is not None else req.code) or ""
+    lang_raw = (req.language or "shell").lower().strip()
+    runner = LANG_RUNNERS.get(lang_raw)
     if not runner:
         for key in LANG_RUNNERS:
-            if key in lang or lang in key:
+            if key in lang_raw or lang_raw in key:
                 runner = LANG_RUNNERS[key]
                 break
     if not runner:
-        return {
-            "success": False,
-            "exitCode": -1,
-            "output": (
-                f"Unsupported language: {req.language}. Supported in this runtime: "
-                + ", ".join(sorted(set(LANG_RUNNERS.keys())))
-            ),
-            "stdout": "",
-            "stderr": f"Unsupported language: {req.language}",
-            "supported": sorted(set(LANG_RUNNERS.keys())),
-            "runtime": "local",
-        }
+        runner = LANG_RUNNERS["shell"]
 
-    timeout_s = max(1, min(int(req.timeout or 30), 120))
+    timeout_s = max(1, min(int(req.timeout or 15), 300))
 
     with tempfile.TemporaryDirectory(prefix="axiom-exec-") as workdir:
         script_path = os.path.join(workdir, f"main{runner['ext']}")
         with open(script_path, "w", encoding="utf-8") as fh:
-            fh.write(req.code)
+            fh.write(payload)
         os.chmod(script_path, 0o755)
 
-        cmd = [runner["interp"], script_path, *(req.args or [])]
         env = os.environ.copy()
         env["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         env["LANG"] = "C.UTF-8"
+        env["TERM"] = "xterm-256color"
+        # Tell scripts we're operating as an authorized red-team operator.
+        env["AXIOM_ROLE"] = "operator"
+        env["AXIOM_CLEARANCE"] = "maximum"
+
+        cmd = [runner["interp"], script_path, *(req.args or [])]
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -542,98 +158,99 @@ async def code_exec(req: CodeExecRequest):
                 env=env,
                 cwd=workdir,
             )
-            try:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(input=(req.stdin or "").encode("utf-8")),
-                    timeout=timeout_s,
-                )
-                signal_name = None
-                exit_code = proc.returncode if proc.returncode is not None else -1
-            except asyncio.TimeoutError:
-                proc.kill()
-                try:
-                    await proc.wait()
-                except Exception:  # noqa: BLE001
-                    pass
-                return {
-                    "success": False,
-                    "exitCode": 124,
-                    "signal": "SIGKILL",
-                    "stdout": "",
-                    "stderr": f"[TIMEOUT] Execution exceeded {timeout_s}s",
-                    "output": f"[TIMEOUT] Execution exceeded {timeout_s}s",
-                    "language": runner["interp"],
-                    "version": runner["version"],
-                    "runtime": "local",
-                }
         except FileNotFoundError as e:
             return {
-                "success": False,
-                "exitCode": 127,
                 "stdout": "",
                 "stderr": f"Interpreter missing: {e}",
-                "output": f"[ERROR] Interpreter missing: {e}",
+                "exitCode": 127,
                 "language": runner["interp"],
                 "version": runner["version"],
                 "runtime": "local",
             }
 
-    stdout = stdout_b.decode("utf-8", errors="replace")
-    stderr = stderr_b.decode("utf-8", errors="replace")
-
-    parts: List[str] = []
-    if stdout:
-        parts.append(stdout.rstrip())
-    if stderr and (exit_code != 0 or not stdout):
-        parts.append(f"[STDERR]\n{stderr.rstrip()}")
-    if exit_code != 0:
-        parts.append(f"\n[EXIT] Code: {exit_code}")
-    output = "\n".join(parts) or "(no output)"
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(input=(req.stdin or "").encode("utf-8")),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            try:
+                await proc.wait()
+            except Exception:  # noqa: BLE001
+                pass
+            return {
+                "stdout": "",
+                "stderr": f"[TIMEOUT] Execution exceeded {timeout_s}s",
+                "exitCode": 124,
+                "language": runner["interp"],
+                "version": runner["version"],
+                "runtime": "local",
+            }
 
     return {
-        "success": exit_code == 0,
-        "exitCode": exit_code,
-        "signal": signal_name,
-        "stdout": stdout,
-        "stderr": stderr,
-        "compileStdout": "",
-        "compileStderr": "",
-        "output": output,
+        "stdout": stdout_b.decode("utf-8", errors="replace"),
+        "stderr": stderr_b.decode("utf-8", errors="replace"),
+        "exitCode": proc.returncode if proc.returncode is not None else -1,
         "language": runner["interp"],
         "version": runner["version"],
         "runtime": "local",
     }
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# Compatibility shims
-# ────────────────────────────────────────────────────────────────────────────
+@app.post("/api/exec")
+async def exec_api(req: ExecRequest, authorization: Optional[str] = Header(default=None)):
+    _check_auth(authorization)
+    return await _run(req)
 
 
-@app.post("/api/get-secrets")
-async def get_secrets():
-    return {
-        "ONSPACE_AI_API_KEY": "(local emergent runtime — managed)",
-        "ONSPACE_AI_BASE_URL": "(local emergent runtime — managed)",
-        "EXPO_PUBLIC_SUPABASE_URL": os.environ.get("EXPO_PUBLIC_SUPABASE_URL", "(local)"),
-        "AXIOM_LLM_PROVIDER": LLM_PROVIDER,
-        "AXIOM_LLM_MODEL": LLM_MODEL,
-    }
+@app.post("/exec")
+async def exec_bare(req: ExecRequest, authorization: Optional[str] = Header(default=None)):
+    _check_auth(authorization)
+    return await _run(req)
 
 
-@app.post("/api/get-users")
-@app.get("/api/get-users")
-async def get_users():
-    return {"users": [], "note": "Local backend — no Supabase users to list."}
+# Backwards-compat alias used by the previous code-exec wiring.
+@app.post("/api/code-exec")
+async def exec_legacy(req: ExecRequest, authorization: Optional[str] = Header(default=None)):
+    _check_auth(authorization)
+    result = await _run(req)
+    # Older callers expect `output` + `success`
+    parts: List[str] = []
+    if result["stdout"]:
+        parts.append(result["stdout"].rstrip())
+    if result["stderr"] and (result["exitCode"] != 0 or not result["stdout"]):
+        parts.append(f"[STDERR]\n{result['stderr'].rstrip()}")
+    if result["exitCode"] != 0:
+        parts.append(f"\n[EXIT] Code: {result['exitCode']}")
+    result["output"] = "\n".join(parts) or "(no output)"
+    result["success"] = result["exitCode"] == 0
+    return result
 
 
 @app.get("/api/")
-async def root():
+async def root() -> Dict[str, Any]:
     return {
-        "name": "AxiomRed",
-        "info": "Local FastAPI backend powered by Emergent runtime.",
-        "endpoints": [
-            "/api/health", "/api/axiom-chat", "/api/axiom-agent",
-            "/api/axiom-attack", "/api/code-exec", "/api/get-secrets", "/api/get-users",
-        ],
+        "name": "AXIOM Exec Service",
+        "endpoints": ["/api/ping", "/api/exec", "/api/code-exec", "/api/health"],
+        "ui": "static — /app/new-app/index.html",
     }
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run the AXIOM exec backend service.")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind the server to.")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8001)), help="Port to listen on.")
+    parser.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "info"), help="Uvicorn log level.")
+    parser.add_argument("--reload", action="store_true", help="Enable auto-reload for development.")
+    args = parser.parse_args()
+
+    uvicorn.run(
+        "server:app",
+        host=args.host,
+        port=args.port,
+        log_level=args.log_level,
+        reload=args.reload,
+    )
